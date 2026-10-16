@@ -1,0 +1,29 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local artifacts (release bundles, eval reports, generated variants)
+outputs/
+
+# Upstream ART tree, payloads, Python embed zip, raw NGES logs — too large / not ours
+/ref/*
+!/ref/README.md
+
+# Customer / lab telemetry used for a specific eval run
+eval/logs/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
