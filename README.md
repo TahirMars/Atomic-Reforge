@@ -9,23 +9,22 @@
 本仓库两块能力：
 
 1. **atomic-reforge**：读取 Atomic Red Team，在 TTP 与攻击意图不变的前提下变形、离线打包、实机执行。
-2. **eval**：对照执行日志与 NGES 遥测/告警，出「可见 / 检出 / 告警」测评报告。详见 [`eval/README.md`](eval/README.md)。
+2. **eval**（仅本地，不进 Git）：对照执行日志与 EDR 遥测/告警，出「可见 / 检出 / 告警」测评报告。本机有 `eval/` 时可看 [`eval/README.md`](eval/README.md)。
 
 ## 仓库结构（提交范围）
 
 | 路径 | 提交？ | 说明 |
 | --- | --- | --- |
 | `src/atomic_reforge/` | 是 | 变形、release、run |
-| `eval/`（不含 `logs/`） | 是 | NGES 对照测评代码、夹具、ATT&CK 索引 |
-| `tests/` | 是 | pytest |
+| `tests/` | 是 | pytest（不含本地 `test_eval.py`） |
 | `scripts/` | 是 | 远程 payload 预取 |
 | `pyproject.toml` / `uv.lock` / `LICENSE` | 是 | 工程元数据 |
-| `eval/testdata/` | 是 | 几 KB 夹具，不是真实遥测 |
-| `ref/` | **否** | 上游 ART、embed Python、原始 NGES 日志，见 [`ref/README.md`](ref/README.md) |
+| `eval/` | **否** | EDR 对照测评代码、夹具、日志，仅本机保留 |
+| `tests/test_eval.py` | **否** | eval 单测，跟 `eval/` 一起留在本机 |
+| `ref/` | **否** | 上游 ART、embed Python、原始 EDR 日志，见 [`ref/README.md`](ref/README.md) |
 | `outputs/` | **否** | release 包、测评 HTML/JSON（可达 GB） |
-| `eval/logs/` | **否** | 某次实机 `run-*.json` 与 NGES 分段日志 |
 
-根目录已有 `.gitignore`。克隆后需自行放入 `ref/atomic-red-team-master/`，测评时用 `--telemetry` 指向本机 NGES 日志即可。
+根目录已有 `.gitignore`。克隆后需自行放入 `ref/atomic-red-team-master/`，测评时用 `--telemetry` 指向本机 EDR 日志即可。
 
 ## 核心约束
 
@@ -100,22 +99,23 @@ atomic-reforge report --path outputs/variants --format md --output outputs/repor
 
 ## 测评（eval）
 
-实机 `run --execute` 之后，用执行 JSONL 对照 NGES 的 `*_telemetry.log` / `*_alert.log`：
+实机 `run --execute` 之后，用执行 JSONL 对照 EDR 的 `*_telemetry.log` / `*_alert.log`：
 
 ```text
 python -m eval --atomic-logs C:\ProgramData\atomic_reforge_logs ^
-               --telemetry <NGES日志目录> ^
+               --telemetry <EDR日志目录> ^
                --out outputs\eval
 ```
 
 三层不要混：`「可见」`（命令对上了）≠ 检出（Technique 对齐）≠ 告警（alert.log 工单）。夹具自测：
 
 ```text
-python -m pytest tests/test_eval.py tests/test_runtime.py tests/test_runner.py -q
-python -m eval --atomic-logs eval/testdata/run-fixture.json --telemetry eval/testdata/telemetry.ndjson --out outputs/eval
+python -m pytest tests/test_runtime.py tests/test_runner.py -q
+# 本机有 eval/ 时：python -m pytest tests/test_eval.py -q
+# python -m eval --atomic-logs eval/testdata/run-fixture.json --telemetry eval/testdata/telemetry.ndjson --out outputs/eval
 ```
 
-完整口径、父技术开关、从 JSON 重渲 HTML：见 [`eval/README.md`](eval/README.md)。
+完整口径、父技术开关、从 JSON 重渲 HTML：本机有 `eval/` 时见 [`eval/README.md`](eval/README.md)。
 
 ### 远程脚本本地化（全量默认开启）
 
@@ -280,12 +280,12 @@ src/atomic_reforge/
 
 ## 建议提交到 Git 的命令
 
-确认没有把 `ref/`、`outputs/`、`eval/logs/` 加进去之后：
+确认没有把 `ref/`、`outputs/`、`eval/` 加进去之后：
 
 ```text
 git add .gitignore README.md LICENSE pyproject.toml uv.lock manual_download.md
-git add src/atomic_reforge tests scripts eval
-git status   # 不应出现 outputs/、ref/atomic-red-team、*.log
+git add src/atomic_reforge tests scripts
+git status   # 不应出现 outputs/、ref/atomic-red-team、eval/、*.log
 ```
 
 `prompt.txt` 是内部需求草稿，一般不必提交。

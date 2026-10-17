@@ -13,12 +13,13 @@ htmlcov/
 # Local artifacts (release bundles, eval reports, generated variants)
 outputs/
 
-# Upstream ART tree, payloads, Python embed zip, raw NGES logs — too large / not ours
+# Upstream ART tree, payloads, Python embed zip, raw EDR logs — too large / not ours
 /ref/*
 !/ref/README.md
 
-# Customer / lab telemetry used for a specific eval run
-eval/logs/
+# Local EDR eval pipeline (kept on disk, not published)
+/eval/
+/tests/test_eval.py
 
 # Editors / OS
 .idea/

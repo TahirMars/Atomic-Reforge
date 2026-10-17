@@ -6,7 +6,7 @@
 | --- | --- |
 | `atomic-red-team-master/` | 上游 Atomic Red Team（含 `atomics/` 与 `enterprise-attack.json`） |
 | `python-*-embed-amd64.zip` | 可选：便携 Python，供 `atomic-reforge release --bundle-runtime` |
-| `nges/` 或测评机拷回的 `*_telemetry.log` / `*_alert.log` | NGES 原始日志，用 `--telemetry` 指向即可 |
+| `edr/` 或测评机拷回的 `*_telemetry.log` / `*_alert.log` | EDR 原始日志，用 `--telemetry` 指向即可 |
 
 `generate` / `release` 通过 `sys.path` 从 `atomic-red-team-master/` 导入上游 schema。没有这份树时，变形与离线打包无法运行。
 
