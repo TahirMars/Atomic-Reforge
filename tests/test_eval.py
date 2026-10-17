@@ -7,6 +7,7 @@ from pathlib import Path
 
 from eval.atomic_logs import extract_signatures, load_jsonl, strategy_from_name
 from eval.cli import evaluate, expand_telemetry
+from eval.report import _variant_display
 from eval.match import MatchConfig, match_episodes, observe_score, technique_relation
 from eval.metrics import compute
 from eval.nges.parse import expand_nges_records, load_events
@@ -81,6 +82,12 @@ def test_extract_techniques_score_ttp_without_id():
 
 def test_strategy_from_variant_name():
     assert strategy_from_name("x - reforge/identity_original") == "identity/original"
+
+
+def test_variant_display_strips_identity_suffix():
+    assert _variant_display("Early Cascade - reforge/identity_original") == "Early Cascade"
+    assert _variant_display("Keep other - reforge/obfuscate_cmd") == "Keep other - reforge/obfuscate_cmd"
+    assert _variant_display("") == "—"
 
 
 def test_signatures_skip_generic_powershell():
@@ -259,6 +266,10 @@ def test_fixture_metrics(tmp_path: Path):
     assert "测评结论" in summary
     assert "短板在识别而不是采集" not in summary
     assert "没有落到 alert.log" in summary
+    assert "Atomic Red Team" in summary
+    assert "Windows" in summary
+    assert "仅供参考" in summary
+    assert "算在分母里" in summary
     assert "ttp-row" in html
     assert 'id="filter"' in html
     assert "推测" in html
@@ -284,6 +295,8 @@ def test_fixture_metrics(tmp_path: Path):
     assert "Stealth（隐蔽）" in tbody
     assert "<h3>状态说明</h3>" in section
     assert "告警且标对" in section
+    assert "标对但告警不对齐" in section
+    assert "至少有一张告警工单" in section
     assert "告警但 TTP 不对齐" in section
     assert "不是误报候选" in section
     assert "回合状态（执行成功回合，互斥，取最强）" not in html
@@ -292,6 +305,14 @@ def test_fixture_metrics(tmp_path: Path):
     assert cmd
     assert cmd in html
     assert "class='wrap cmd'" in html
+    assert "ttp-hit-rule" in html
+    assert "遥测规则" in html
+    assert "EDR Technique" not in html
+    assert "Process injection via Early Cascade APC" in html
+    assert "Early Cascade" in html
+    assert "- reforge/identity_original" not in html
+    assert "无规则名" in html
+    assert "ttp-pair" in html
 
 
 def test_enterprise_matrix_covers_non_windows_ids():
@@ -550,6 +571,96 @@ def test_wrong_ttp_lists_edr_technique_in_report(tmp_path: Path):
     (tmp_path / "wrong.html").write_text(html, encoding="utf-8")
 
 
+def test_wrong_rule_prefers_nonempty_name():
+    from eval.atomic_logs import Episode
+
+    cmd = r"C:\atomics\T1137.006\bin\Addins\ExcelVBAaddin.xlam"
+    ep = Episode(
+        technique_id="T1137.006",
+        variant_guid="guid-empty-then-named",
+        variant_name="XLAM",
+        timestamp=_utc("2026-10-08T02:41:00Z"),
+        duration_s=2,
+        executor="powershell",
+        command=cmd,
+        argv=cmd,
+        exit_code=0,
+        timed_out=False,
+        had_error=False,
+        executed_ok=True,
+        strategy="identity/original",
+        signatures=extract_signatures(cmd, cmd, "T1137.006"),
+    )
+    command = rf'powershell.exe Copy "{cmd}" "$env:APPDATA\Microsoft\Excel\XLSTART\notepad.xlam"'
+    empty = _event(
+        "2026-10-08T02:41:01Z",
+        techniques=("T1574.001",),
+        command=command,
+        rule_id="1",
+        rule_name="",
+    )
+    named = _event(
+        "2026-10-08T02:41:02Z",
+        techniques=("T1574.001",),
+        command=command,
+        rule_id="2",
+        rule_name="Potential DLL search order hijack",
+    )
+    m = match_episodes([ep], [empty, named], MatchConfig()).matches[0]
+    assert m.wrong_techniques == ["T1574.001"]
+    assert m.wrong_rules == ["Potential DLL search order hijack"]
+
+
+def test_hit_rule_shown_beside_each_technique():
+    from eval.atomic_logs import Episode
+    from eval.report import build_payload, render_html
+
+    cmd = r"C:\atomics\T1055.004\src\inject.ps1"
+    ep = Episode(
+        technique_id="T1055.004",
+        variant_guid="guid-pair",
+        variant_name="Early Cascade",
+        timestamp=_utc("2026-10-08T02:41:00Z"),
+        duration_s=2,
+        executor="powershell",
+        command=cmd,
+        argv=cmd,
+        exit_code=0,
+        timed_out=False,
+        had_error=False,
+        executed_ok=True,
+        strategy="identity/original",
+        signatures=extract_signatures(cmd, cmd, "T1055.004"),
+    )
+    ev = _event(
+        "2026-10-08T02:41:01Z",
+        techniques=("T1055", "T1055.004"),
+        command=f"powershell.exe -Command {cmd}",
+        rule_id="1001",
+        rule_name="Process injection via Early Cascade APC",
+        tactics=("TA0005",),
+    )
+    result = match_episodes([ep], [ev], MatchConfig())
+    m = result.matches[0]
+    assert m.hit_techniques == ["T1055", "T1055.004"]
+    assert m.hit_rules == [
+        "Process injection via Early Cascade APC",
+        "Process injection via Early Cascade APC",
+    ]
+    html = render_html(
+        build_payload(
+            result=result,
+            atomic_paths=["fixture"],
+            telemetry_paths=["fixture"],
+            skipped=[],
+            errors=[],
+            stamp="pair",
+        )
+    )
+    assert html.count("ttp-pair") >= 2
+    assert html.count("Process injection via Early Cascade APC") >= 2
+
+
 def test_alerted_status_from_alert_event():
     from eval.atomic_logs import Episode
 
@@ -586,6 +697,140 @@ def test_alerted_status_from_alert_event():
     assert m.alerted is True
     assert m.detected is True
     assert m.status == "alerted"
+    assert m.alert_rule_techniques.get("LSA secrets registry export using tools") == [
+        "T1003.004"
+    ]
+    from eval.report import _alert_rule_cell
+
+    cell = _alert_rule_cell(
+        {
+            "technique_id": "T1003.004",
+            "status": "alerted",
+            "alert_rules": ["LSA secrets registry export using tools"],
+            "alert_rule_techniques": {
+                "LSA secrets registry export using tools": ["T1003.004"]
+            },
+        }
+    )
+    assert "T1003.004" in cell
+    assert "ttp-hit" in cell
+    assert "ttp-hit-rule" in cell
+    assert "LSA secrets registry export using tools" in cell
+    missing = _alert_rule_cell(
+        {
+            "technique_id": "T1003.004",
+            "status": "alerted",
+            "alert_rules": ["(无规则名)"],
+            "alert_rule_techniques": {"(无规则名)": ["T1112"]},
+        }
+    )
+    assert "T1112" in missing
+    assert "ttp-wrong" in missing
+    assert "无规则名" in missing
     summary = compute(result)["summary"]
     assert summary["alerted"] == 1
     assert summary["alert_rate"] == 1.0
+    assert m.alert_aligned is True
+
+
+def test_one_aligned_alert_among_many_is_告警且标对():
+    from eval.atomic_logs import Episode
+
+    cmd = r"C:\atomics\ExternalPayloads\reforge_remote\ext\gsecdump.exe -a"
+    ep = Episode(
+        technique_id="T1003.004",
+        variant_guid="g-multi-alert",
+        variant_name="gsecdump",
+        timestamp=_utc("2026-10-08T02:41:00Z"),
+        duration_s=1,
+        executor="command_prompt",
+        command=cmd,
+        argv=cmd,
+        exit_code=0,
+        timed_out=False,
+        had_error=False,
+        executed_ok=True,
+        strategy="identity/original",
+        signatures=extract_signatures(cmd, cmd, "T1003.004"),
+    )
+    hay = r"cmd.exe /c " + cmd
+    wrong = _event(
+        "2026-10-08T02:41:01Z",
+        techniques=("T1550.002",),
+        command=hay,
+        rule_id="3001",
+        rule_name="Overpass-the-hash attack using hacktools",
+        kind="alert",
+    )
+    right = _event(
+        "2026-10-08T02:41:02Z",
+        techniques=("T1003.004",),
+        command=hay,
+        rule_id="1100",
+        rule_name="LSA secrets registry export using tools",
+        kind="alert",
+    )
+    m = match_episodes([ep], [wrong, right], MatchConfig()).matches[0]
+    assert m.alerted is True
+    assert m.detected is True
+    assert m.alert_aligned is True
+    assert m.status == "alerted"
+
+
+def test_unrelated_alert_is_not_告警且标对():
+    from eval.atomic_logs import Episode
+    from eval.report import build_payload, render_html
+
+    cmd = r"SCHTASKS /Create /SC ONCE /TN spawn /TR C:\windows\system32\cmd.exe /ST 20:10"
+    ep = Episode(
+        technique_id="T1053.005",
+        variant_guid="guid-sched",
+        variant_name="Scheduled task Local",
+        timestamp=_utc("2026-10-08T02:41:00Z"),
+        duration_s=2,
+        executor="command_prompt",
+        command=cmd,
+        argv=cmd,
+        exit_code=0,
+        timed_out=False,
+        had_error=False,
+        executed_ok=True,
+        strategy="identity/original",
+        signatures=extract_signatures(cmd, cmd, "T1053.005"),
+    )
+    tel = _event(
+        "2026-10-08T02:41:01Z",
+        techniques=("T1021", "T1053.005"),
+        command=cmd,
+        rule_id="2001",
+        rule_name="Scheduled task creation or modification using white hat tools",
+    )
+    alert = _event(
+        "2026-10-08T02:41:02Z",
+        techniques=("T1550.002", "T1059", "T1021"),
+        command=cmd,
+        rule_id="3001",
+        rule_name="Overpass-the-hash attack using hacktools",
+        kind="alert",
+    )
+    result = match_episodes([ep], [tel, alert], MatchConfig())
+    m = result.matches[0]
+    assert m.detected is True
+    assert m.detection_kind == "exact"
+    assert m.alerted is True
+    assert m.alert_aligned is False
+    assert m.status == "ttp_detected_alert_wrong"
+    assert m.hit_techniques == ["T1053.005"]
+    assert "T1021" in m.wrong_techniques
+    html = render_html(
+        build_payload(
+            result=result,
+            atomic_paths=["fixture"],
+            telemetry_paths=["fixture"],
+            skipped=[],
+            errors=[],
+            stamp="sched-alert",
+        )
+    )
+    assert "标对但告警不对齐" in html
+    assert "Overpass-the-hash attack using hacktools" in html

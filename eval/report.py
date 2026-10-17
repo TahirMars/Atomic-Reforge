@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,15 @@ from .atomic_logs import (
     guess_failure,
     normalize_failure_reason,
 )
-from .match import DetectionCluster, EpisodeMatch, MatchResult, is_reforge_runner_command
+from .match import (
+    DetectionCluster,
+    EpisodeMatch,
+    MatchResult,
+    alert_ttp_aligned,
+    is_reforge_runner_command,
+    normalize_technique,
+    technique_relation,
+)
 from .attck import TACTIC_PHASES, split_tactics, tactic_display
 from .metrics import LOW_RECALL, compute, count_by_tactic_phase, count_episodes_by_tactic
 
@@ -38,6 +47,8 @@ CSV_COLUMNS = [
     "wrong_techniques",
     "wrong_rules",
     "hit_rules",
+    "alert_rules",
+    "alert_techniques",
     "exit_code",
     "failure_reason",
     "failure_guess",
@@ -142,6 +153,8 @@ def _episode_row(m: EpisodeMatch) -> dict[str, Any]:
         "detected": m.detected,
         "alerted": m.alerted,
         "alert_rules": m.alert_rules,
+        "alert_rule_techniques": m.alert_rule_techniques,
+        "alert_aligned": m.alert_aligned,
         "detection_kind": m.detection_kind,
         "wrong_ttp": m.wrong_ttp,
         "latency_s": m.latency_s,
@@ -172,6 +185,7 @@ def _fp_row(cluster: DetectionCluster) -> dict[str, Any]:
 STATUS_BADGE = {
     "ttp_detected": ("pass", "标对"),
     "alerted": ("pass", "告警且标对"),
+    "ttp_detected_alert_wrong": ("neutral", "标对但告警不对齐"),
     "alerted_wrong_ttp": ("neutral", "告警但 TTP 不对齐"),
     "observed_wrong_ttp": ("fail", "标成别的 TTP"),
     "observed_unlabeled": ("fail", "「可见」未标 TTP"),
@@ -181,7 +195,8 @@ STATUS_BADGE = {
 
 STATUS_MEANING = {
     "ttp_detected": "「可见」且 Technique 对齐，但没有 alert.log 工单。算检出（召回的 TP），不算告警。",
-    "alerted": "「可见」且 Technique 对齐，并且有告警工单。既算检出，也算告警。",
+    "alerted": "「可见」且 Technique 对齐，并且窗内至少有一张告警工单的 Technique 对齐本次 Atomic（多张工单时其余可以对不齐）。既算检出，也算告警。",
+    "ttp_detected_alert_wrong": "遥测 Technique 对齐（算检出），窗内也有告警工单（算告警率），但所有工单的 TTP 都对不上本次 Atomic。不是「告警且标对」。",
     "alerted_wrong_ttp": "「可见」且出了告警工单，但 Technique 对不上本次 Atomic。算告警率，不算检出，计入漏报。",
     "observed_wrong_ttp": "「可见」，窗内对得上的事件打了 Technique，但和本次 technique_id 无关。不算检出，计入漏报。回合明细里红色列出这些错标。不是误报候选（误报候选是没挂上任何成功 Atomic 的簇）。",
     "observed_unlabeled": "「可见」，但对得上的事件没有 Technique 标签。不算检出，计入漏报。",
@@ -213,6 +228,43 @@ def enrich_failures(payload: dict[str, Any]) -> dict[str, Any]:
         summary["failure_guesses"] = dict(
             Counter(row.get("failure_guess") or "—" for row in failed)
         )
+    return payload
+
+
+def resolve_episode_status(ep: dict[str, Any]) -> str:
+    if not ep.get("executed_ok"):
+        return "not_executed"
+    detected = bool(ep.get("detected"))
+    alerted = bool(ep.get("alerted"))
+    observed = bool(ep.get("observed"))
+    aligned = bool(ep.get("alert_aligned")) or alert_ttp_aligned(
+        str(ep.get("technique_id") or ""), ep.get("alert_rule_techniques") or {}
+    )
+    if alerted and detected:
+        return "alerted" if aligned else "ttp_detected_alert_wrong"
+    if alerted and not detected:
+        return "alerted_wrong_ttp"
+    if detected:
+        return "ttp_detected"
+    if observed and (ep.get("wrong_ttp") or ep.get("wrong_techniques")):
+        return "observed_wrong_ttp"
+    if observed:
+        return "observed_unlabeled"
+    return "executed_not_observed"
+
+
+def enrich_episode_status(payload: dict[str, Any]) -> dict[str, Any]:
+    """Recompute 告警且标对 vs 标对但告警不对齐 from alert TTP alignment."""
+    episodes = payload.get("episodes") or []
+    for ep in episodes:
+        ep["alert_aligned"] = alert_ttp_aligned(
+            str(ep.get("technique_id") or ""), ep.get("alert_rule_techniques") or {}
+        )
+        ep["status"] = resolve_episode_status(ep)
+    ok = [e for e in episodes if e.get("executed_ok")]
+    payload.setdefault("summary", {})["status_counts"] = dict(
+        Counter(str(e.get("status") or "") for e in ok)
+    )
     return payload
 
 
@@ -272,47 +324,119 @@ def _short(text: Any, limit: int = CMD_MAX) -> str:
     return value[: limit - 1] + "…"
 
 
+_IDENTITY_SUFFIX_RE = re.compile(r"\s*-\s*reforge/identity_original\s*$", re.I)
+
+
+def _variant_display(name: Any, fallback: str = "—") -> str:
+    value = "" if name is None else str(name).strip()
+    value = _IDENTITY_SUFFIX_RE.sub("", value).strip()
+    return value or fallback
+
+
+def _edr_rule_labels(tids: list[str], rules: list[str]) -> list[str]:
+    n = len(tids)
+    if n == 0:
+        return []
+    labeled = list(rules or [])
+    if len(labeled) == n:
+        return labeled
+    shared = next((r for r in labeled if r), "")
+    return [shared] * n
+
+
+def _tech_pair(tid: str, rule: str, *, hit: bool) -> str:
+    css = "ttp-hit" if hit else "ttp-wrong"
+    rule_css = "ttp-hit-rule" if hit else "ttp-wrong-rule"
+    kind = "标对" if hit else "标错"
+    title = f"{kind}：{rule}" if rule else f"{kind}：遥测未给规则名"
+    rule_html = (
+        f'<span class="{rule_css}">{_esc(rule)}</span>'
+        if rule
+        else '<span class="ttp-rule-missing">无规则名</span>'
+    )
+    return (
+        f'<span class="ttp-pair">'
+        f'<code class="{css}" title="{_esc(title)}">{_esc(tid)}</code>'
+        f"{rule_html}"
+        "</span>"
+    )
+
+
 def _edr_technique_cell(ep: dict[str, Any]) -> str:
     chunks: list[str] = []
-    for tid in ep.get("hit_techniques") or []:
-        if tid:
-            chunks.append(f'<code class="ttp-hit" title="标对">{_esc(tid)}</code>')
-    wrong = list(ep.get("wrong_techniques") or [])
-    rules = list(ep.get("wrong_rules") or [])
+    atomic = str(ep.get("technique_id") or "")
+    seen: set[tuple[str, str, bool]] = set()
+
+    def add(tid: str, rule: str, *, hit: bool) -> None:
+        key = (normalize_technique(tid), rule or "", hit)
+        if key in seen:
+            return
+        seen.add(key)
+        chunks.append(_tech_pair(tid, rule, hit=hit))
+
+    hits = [t for t in (ep.get("hit_techniques") or []) if t]
+    for tid, rule in zip(hits, _edr_rule_labels(hits, list(ep.get("hit_rules") or []))):
+        aligned = technique_relation(atomic, tid) != "unrelated"
+        add(tid, rule, hit=aligned)
+    wrong = [t for t in (ep.get("wrong_techniques") or []) if t]
+    wrules = list(ep.get("wrong_rules") or [])
     for i, tid in enumerate(wrong):
-        if not tid:
-            continue
-        rule = rules[i] if i < len(rules) else ""
-        title = f"标错：{rule}" if rule else "标错：与本次 Atomic 不对齐"
-        chunks.append(f'<code class="ttp-wrong" title="{_esc(title)}">{_esc(tid)}</code>')
-        if rule:
-            chunks.append(f'<span class="ttp-wrong-rule">{_esc(rule)}</span>')
+        rule = wrules[i] if i < len(wrules) else ""
+        add(tid, rule, hit=False)
     if not chunks:
         return "—"
     return f'<div class="tids">{"".join(chunks)}</div>'
 
 
+def _alert_rule_label(name: str) -> str:
+    if not name or name == "(无规则名)":
+        return ""
+    return name
+
+
 def _alert_rule_cell(ep: dict[str, Any]) -> str:
-    alerts = [a for a in (ep.get("alert_rules") or []) if a]
-    if not alerts:
+    by_rule = ep.get("alert_rule_techniques") or {}
+    names = [a for a in (ep.get("alert_rules") or []) if a]
+    for key in by_rule:
+        if key not in names:
+            names.append(key)
+    if not names:
         return "—"
-    css = "ttp-wrong" if ep.get("status") == "alerted_wrong_ttp" else "ttp-hit"
-    title = "告警但 TTP 不对齐" if css == "ttp-wrong" else "告警"
-    return (
-        '<div class="tids">'
-        + "".join(
-            f'<span class="{css}" title="{_esc(title)}">{_esc(name)}</span>'
-            for name in alerts
-        )
-        + "</div>"
-    )
+    atomic = str(ep.get("technique_id") or "")
+    chunks: list[str] = []
+    seen: set[tuple[str, str, bool]] = set()
+    for name in names:
+        rule = _alert_rule_label(str(name))
+        techs = [t for t in (by_rule.get(name) or []) if t]
+        if not techs:
+            key = ("", rule, False)
+            if key not in seen:
+                seen.add(key)
+                rule_css = "ttp-wrong-rule"
+                body = (
+                    f'<span class="{rule_css}">{_esc(rule)}</span>'
+                    if rule
+                    else '<span class="ttp-rule-missing">无规则名</span>'
+                )
+                chunks.append(f'<span class="ttp-pair">{body}</span>')
+            continue
+        for tid in techs:
+            aligned = technique_relation(atomic, tid) != "unrelated"
+            key = (normalize_technique(tid), rule, aligned)
+            if key in seen:
+                continue
+            seen.add(key)
+            chunks.append(_tech_pair(tid, rule, hit=aligned))
+    if not chunks:
+        return "—"
+    return f'<div class="tids">{"".join(chunks)}</div>'
 
 
 def _status_section() -> str:
     return (
         "<h3>状态说明</h3>"
         '<p class="muted">执行成功回合，互斥，取最强。战术汇总里的彩色标签就是这些状态。'
-        "标对 / 告警且标对 = 检出；其余执行成功状态都算漏报。误报候选不是回合状态。</p>"
+        "标对 / 告警且标对 / 标对但告警不对齐 = 检出；其余执行成功状态都算漏报。误报候选不是回合状态。</p>"
         '<table class="glossary">'
         "<thead><tr><th>状态</th><th>含义</th></tr></thead>"
         f"<tbody>{_status_glossary_rows()}</tbody>"
@@ -582,6 +706,7 @@ def _verdict(payload: dict[str, Any]) -> str:
     n_alert = int(s.get("alerted") or 0)
     n_hit_alert = int(sc.get("alerted") or 0)
     n_hit_only = int(sc.get("ttp_detected") or 0)
+    n_hit_alert_wrong = int(sc.get("ttp_detected_alert_wrong") or 0)
     n_alert_wrong = int(sc.get("alerted_wrong_ttp") or 0)
     vis = s.get("visibility_rate")
     rec = s.get("recall")
@@ -618,7 +743,13 @@ def _verdict(payload: dict[str, Any]) -> str:
         )
         if n_alert:
             bits.append(
-                f"：其中告警且标对 {_num(n_hit_alert)} 条（既准又响），"
+                f"：其中告警且标对 {_num(n_hit_alert)} 条（至少一张工单 TTP 对齐），"
+            )
+            if n_hit_alert_wrong:
+                bits.append(
+                    f"标对但告警不对齐 {_num(n_hit_alert_wrong)} 条（遥测标对了，工单指到别的技术），"
+                )
+            bits.append(
                 f"告警但 TTP 不对齐 {_num(n_alert_wrong)} 条（出了工单但指向错技术）。"
             )
             if n_hit_only:
@@ -637,8 +768,20 @@ def _verdict(payload: dict[str, Any]) -> str:
     return '<p class="method verdict">' + "".join(bits) + "</p>"
 
 
+def _scope_note() -> str:
+    return (
+        '<p class="note">Atomic Reforge 的测试用例来自 Atomic Red Team（原子红队），'
+        "本场只测评 Windows 相关 TTP。"
+        "Atomic Red Team（原子红队）的每个用例通常只选择一个代表性 Technique 标签；"
+        "真正执行时，命令里往往会包含依赖的其它 TTP，原始用例并没有把实现涉及的全部 Technique 标全。"
+        "精确率把「对不上本次标签」的检出都算在分母里，其中一部分可能是测试用例本身的行为，"
+        "因此该指标仅供参考。</p>"
+    )
+
+
 def render_html(payload: dict[str, Any]) -> str:
     enrich_failures(payload)
+    enrich_episode_status(payload)
     s = payload["summary"]
     meta = payload["meta"]
     n_ok = s.get("executed_ok", 0)
@@ -673,7 +816,7 @@ def render_html(payload: dict[str, Any]) -> str:
             f"<td>{_status_chips(row.get('status_counts') or {})}</td>"
             "</tr>"
         )
-    total_status = _status_chips(s.get("status_counts") or {})
+    total_status = _status_chips((payload.get("summary") or {}).get("status_counts") or {})
     tactic_foot = (
         "<tr>"
         f"<td>合计（执行成功回合）</td>"
@@ -712,7 +855,7 @@ def render_html(payload: dict[str, Any]) -> str:
         for ep in instances:
             inst_rows.append(
                 "<tr>"
-                f"<td><code>{_esc(_short(ep.get('variant_name') or ep.get('variant_guid') or '—', 80))}</code></td>"
+                f"<td class='wrap'><code>{_esc(_variant_display(ep.get('variant_name'), str(ep.get('variant_guid') or '—')))}</code></td>"
                 f"<td>{_badge(str(ep.get('status') or ''))}</td>"
                 f"<td>{_esc(ep.get('detection_kind') or '—')}</td>"
                 f"<td>{_edr_technique_cell(ep)}</td>"
@@ -756,8 +899,8 @@ def render_html(payload: dict[str, Any]) -> str:
                 f"<span class=\"muted\">　命中规则 {_esc(rules)}　告警规则 {_esc(alerts)}</span></h3>"
                 '<table class="instances"><thead><tr>'
                 "<th>变体</th><th>结果</th><th>对齐</th>"
-                f"<th>EDR Technique {_tip('绿色：与本次 Atomic 对齐并完成归属。红色：窗内看见但对齐不上的标签，供排查标错。')}</th>"
-                f"<th>告警规则 {_tip('绿色：告警且 TTP 对齐。橙色：有告警但 TTP 不对齐。')}</th>"
+                f"<th>遥测规则 {_tip('时间窗内遥测打上的 Technique 及规则名。绿色对齐本次 Atomic，红色不对齐。无规则名表示该条遥测只有 TTP 标签、没有 builtinTtpRuleName。')}</th>"
+                f"<th>告警规则 {_tip('工单上的 Technique 及规则名，展示方式和遥测规则列相同。绿色对齐、红色不对齐。无规则名表示工单没有规则名。多张工单时只要有一张绿色，就算告警且标对。')}</th>"
                 f"<th>示例 commandLine {_tip('NGES SourceProcess.commandLine 完整原文；没有窗内命令时回退 Atomic 下发命令。不截断。')}</th>"
                 "</tr></thead><tbody>"
                 + "".join(inst_rows)
@@ -771,7 +914,7 @@ def render_html(payload: dict[str, Any]) -> str:
         failed_rows.append(
             "<tr>"
             f"<td><code>{_esc(row['technique_id'])}</code></td>"
-            f"<td>{_esc(_short(row.get('variant_name'), 80))}</td>"
+            f"<td class='wrap'>{_esc(_variant_display(row.get('variant_name')))}</td>"
             f"<td>{_esc(display_failure_reason(row.get('failure_reason')))}</td>"
             f"<td>{_esc(row.get('exit_code'))}</td>"
             f"<td>{_esc(row.get('failure_guess') or guess_failure(row))}</td>"
@@ -910,7 +1053,10 @@ td.formula em{{font-style:italic;color:var(--text)}}
 .tids code{{background:#0f1419;border:1px solid var(--line);padding:1px 5px;border-radius:3px;white-space:nowrap}}
 code.ttp-hit{{color:var(--green);background:rgba(63,185,80,.15);border-color:rgba(63,185,80,.4)}}
 code.ttp-wrong{{color:var(--red);background:rgba(248,81,73,.15);border-color:rgba(248,81,73,.4)}}
+.ttp-pair{{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:4px;margin:0 10px 4px 0}}
+.ttp-hit-rule{{color:var(--green);font-size:11px}}
 .ttp-wrong-rule{{color:var(--red);font-size:11px}}
+.ttp-rule-missing{{color:var(--muted);font-size:11px}}
 span.ttp-hit{{color:var(--green)}}
 span.ttp-wrong{{color:var(--red)}}
 .instances .tids{{display:flex;flex-wrap:wrap;gap:4px;align-items:center}}
@@ -965,12 +1111,13 @@ td.wrap.cmd{{max-width:none}}
 {_narrative(payload)}
 <div class="summary">{card_html}</div>
 {_verdict(payload)}
+{_scope_note()}
 {_coverage_and_low_visual(payload)}
 </section>
 {_intro_section(payload)}
 <section>
 <h2>按战术</h2>
-<p class="muted">按单个战术阶段汇总。一个 TTP 属于多个阶段时，该回合会同时出现在多行，因此各行之和可以大于合计。状态只统计执行成功的回合，彩色标签见下方「状态说明」。标对 / 告警且标对 = 检出；其余都不算检出。</p>
+<p class="muted">按单个战术阶段汇总。一个 TTP 属于多个阶段时，该回合会同时出现在多行，因此各行之和可以大于合计。状态只统计执行成功的回合，彩色标签见下方「状态说明」。标对 / 告警且标对 / 标对但告警不对齐 = 检出；其余都不算检出。</p>
 <table>
 <thead><tr><th>战术</th><th>执行成功</th><th>「可见」</th><th>检出</th><th>召回</th><th>状态</th></tr></thead>
 <tbody>
@@ -1113,6 +1260,12 @@ def write_csv(payload: dict[str, Any], path: Path) -> None:
                     "wrong_techniques": ";".join(row.get("wrong_techniques") or []),
                     "wrong_rules": ";".join(row.get("wrong_rules") or []),
                     "hit_rules": ";".join(row.get("hit_rules") or []),
+                    "alert_rules": ";".join(row.get("alert_rules") or []),
+                    "alert_techniques": ";".join(
+                        tid
+                        for techs in (row.get("alert_rule_techniques") or {}).values()
+                        for tid in techs
+                    ),
                     "exit_code": row.get("exit_code"),
                     "failure_reason": row.get("failure_reason"),
                     "failure_guess": row.get("failure_guess"),

@@ -65,6 +65,16 @@ def best_relation(atomic_id: str, edr_ids: tuple[str, ...]) -> Relation:
     return best
 
 
+def alert_ttp_aligned(
+    atomic_id: str, alert_rule_techniques: dict[str, list[str]] | None
+) -> bool:
+    for techs in (alert_rule_techniques or {}).values():
+        for tid in techs or []:
+            if tid and technique_relation(atomic_id, tid) != "unrelated":
+                return True
+    return False
+
+
 def relation_counts_as_hit(rel: Relation, parent_match: bool) -> bool:
     if rel in ("exact", "child"):
         return True
@@ -152,6 +162,29 @@ class DetectionCluster:
         return ""
 
 
+def _keep_rule(store: dict[str, str], tid: str, name: str) -> None:
+    tid = (tid or "").strip()
+    if not tid:
+        return
+    name = name or ""
+    prev = store.get(tid)
+    if prev is None or (not prev and name):
+        store[tid] = name
+
+
+def _rules_for_techniques(
+    techniques: tuple[str, ...] | list[str],
+    events: list[NgesEvent],
+    fallback_names: tuple[str, ...] = (),
+) -> list[str]:
+    per: dict[str, str] = {}
+    for ev in events:
+        for tid in ev.techniques:
+            _keep_rule(per, tid, ev.rule_name)
+    shared = next((n for n in fallback_names if n), "")
+    return [per.get(tid) or shared for tid in techniques]
+
+
 def cluster_labeled_events(
     events: list[NgesEvent], gap_sec: float = CLUSTER_GAP_SEC
 ) -> list[DetectionCluster]:
@@ -208,14 +241,19 @@ class EpisodeMatch:
     cluster_index: int | None = None
     alerted: bool = False
     alert_rules: list[str] = field(default_factory=list)
+    alert_rule_techniques: dict[str, list[str]] = field(default_factory=dict)
+    alert_aligned: bool = False
 
     def finalize(self) -> None:
         ep = self.episode
         if not ep.executed_ok:
             self.status = "not_executed"
             return
+        self.alert_aligned = self.alerted and alert_ttp_aligned(
+            ep.technique_id, self.alert_rule_techniques
+        )
         if self.alerted and self.detected:
-            self.status = "alerted"
+            self.status = "alerted" if self.alert_aligned else "ttp_detected_alert_wrong"
             return
         if self.alerted and not self.detected:
             self.status = "alerted_wrong_ttp"
@@ -286,6 +324,20 @@ def _cluster_observe(
     return best, best_matched, best_event
 
 
+def _note_alert(
+    ev: NgesEvent,
+    alert_rules: list[str],
+    alert_techs: dict[str, list[str]],
+) -> None:
+    name = ev.rule_name or "(无规则名)"
+    if name not in alert_rules:
+        alert_rules.append(name)
+    bucket = alert_techs.setdefault(name, [])
+    for tid in ev.techniques:
+        if tid and tid not in bucket:
+            bucket.append(tid)
+
+
 def _rank(rel: Relation, observe: float, dt_abs: float) -> float:
     base = {"exact": 300.0, "child": 250.0, "parent": 200.0, "unrelated": 0.0}[rel]
     return base + observe - min(dt_abs, 60.0) * 0.01
@@ -313,6 +365,7 @@ def match_episodes(
         labeled_unrelated = False
         alert_obs = False
         alert_rules: list[str] = []
+        alert_techs: dict[str, list[str]] = {}
         wrong_techs: dict[str, str] = {}
         best_wrong_cmd = ""
         best_wrong_score = -1.0
@@ -325,8 +378,7 @@ def match_episodes(
                     best_cmd = display_command_line(ev, m.episode.command)
                 if ev.kind == "alert":
                     alert_obs = True
-                    if ev.rule_name and ev.rule_name not in alert_rules:
-                        alert_rules.append(ev.rule_name)
+                    _note_alert(ev, alert_rules, alert_techs)
                 if ev.labeled:
                     rel = best_relation(m.episode.technique_id, ev.techniques)
                     hit = relation_counts_as_hit(rel, config.parent_match)
@@ -335,9 +387,8 @@ def match_episodes(
                             tid
                             and technique_relation(m.episode.technique_id, tid)
                             == "unrelated"
-                            and tid not in wrong_techs
                         ):
-                            wrong_techs[tid] = ev.rule_name or ""
+                            _keep_rule(wrong_techs, tid, ev.rule_name)
                     if not hit:
                         labeled_unrelated = True
                         if score > best_wrong_score:
@@ -352,6 +403,7 @@ def match_episodes(
         m.wrong_rules = [wrong_techs[t] for t in wrong_techs]
         m.alerted = alert_obs
         m.alert_rules = alert_rules
+        m.alert_rule_techniques = alert_techs
 
     # Layer B: greedy 1-1 assignment of labeled clusters to successful episodes.
     candidates: list[tuple[float, int, int, Relation, list[str], NgesEvent]] = []
@@ -389,11 +441,32 @@ def match_episodes(
         m.detection_kind = rel
         m.observed = True
         m.cluster_index = ci
-        m.hit_techniques = list(cluster.techniques)
+        aligned_tids = [
+            t
+            for t in cluster.techniques
+            if t and technique_relation(m.episode.technique_id, t) != "unrelated"
+        ]
+        extra_tids = [
+            t
+            for t in cluster.techniques
+            if t and technique_relation(m.episode.technique_id, t) == "unrelated"
+        ]
+        m.hit_techniques = aligned_tids
         m.hit_tactics = list(
             dict.fromkeys(t for ev in cluster.events for t in ev.tactics)
         )
-        m.hit_rules = list(cluster.rule_names)
+        m.hit_rules = _rules_for_techniques(
+            m.hit_techniques, cluster.events, cluster.rule_names
+        )
+        if extra_tids:
+            extra_rules = _rules_for_techniques(
+                extra_tids, cluster.events, cluster.rule_names
+            )
+            wrong_map = dict(zip(m.wrong_techniques, m.wrong_rules))
+            for tid, rule in zip(extra_tids, extra_rules):
+                _keep_rule(wrong_map, tid, rule)
+            m.wrong_techniques = list(wrong_map)
+            m.wrong_rules = [wrong_map[t] for t in wrong_map]
         m.latency_s = (ev.t_utc - m.episode.t0).total_seconds()
         shown = display_command_line(ev, m.episode.command)
         if shown:
@@ -403,8 +476,8 @@ def match_episodes(
         if any(ev.kind == "alert" for ev in cluster.events):
             m.alerted = True
             for ev in cluster.events:
-                if ev.kind == "alert" and ev.rule_name and ev.rule_name not in m.alert_rules:
-                    m.alert_rules.append(ev.rule_name)
+                if ev.kind == "alert":
+                    _note_alert(ev, m.alert_rules, m.alert_rule_techniques)
 
     for m in matches:
         m.finalize()
